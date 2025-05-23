@@ -489,6 +489,11 @@ class BlockBasedTable : public TableReader {
       const InternalIteratorBase<IndexValue>& index_iter,
       uint64_t data_size) const;
 
+  // Given a start key, returns the approximate data offset by doing a lexi interpolation
+  uint64_t ApproximateDataOffsetWithinBlock(
+      InternalIteratorBase<IndexValue>* index_iter,
+      const Slice& key) const;
+
   // Helper functions for DumpTable()
   Status DumpIndexBlock(std::ostream& out_stream);
   Status DumpDataBlocks(std::ostream& out_stream);

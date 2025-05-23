@@ -2214,12 +2214,12 @@ Status BlockBasedTable::Get(const ReadOptions& read_options, const Slice& key,
             /*referenced_key=*/"", referenced_data_size,
             lookup_data_block_context.num_keys_in_block,
             does_referenced_key_exist);
-        // TODO: Should handle status here?
-        block_cache_tracer_
-            ->WriteBlockAccess(access_record,
-                               lookup_data_block_context.block_key,
-                               rep_->cf_name_for_tracing(), referenced_key)
-            .PermitUncheckedError();
+          // TODO: Should handle status here?
+          block_cache_tracer_
+              ->WriteBlockAccess(access_record,
+                                 lookup_data_block_context.block_key,
+                                 rep_->cf_name_for_tracing(), referenced_key)
+              .PermitUncheckedError();
       }
 
       if (done) {
@@ -2574,6 +2574,104 @@ uint64_t BlockBasedTable::ApproximateDataOffsetOf(
   }
 }
 
+uint64_t BlockBasedTable::ApproximateDataOffsetWithinBlock(
+    InternalIteratorBase<IndexValue>* index_iter,
+    const Slice& key) const {
+  if (!index_iter->Valid()) {
+    return 0;
+  }
+
+  // Get the block handle for the data block
+  BlockHandle handle = index_iter->value().handle;
+
+  // If we have a first_internal_key in the index value, we can use it for better interpolation
+  Slice first_key_in_block;
+  Slice last_key_in_block = index_iter->key();
+
+  if (rep_->index_has_first_key) {
+    first_key_in_block = index_iter->value().first_internal_key;
+  } else {
+    // If first key is not available in the index, we can try to infer it
+    // by checking the previous entry in the index
+
+    // Save our current position and key
+    Slice current_position_key = last_key_in_block;
+
+    // Try to move to previous entry
+    index_iter->Prev();
+    if (index_iter->Valid()) {
+      // Got a previous entry, use its key as our first key approximation
+      first_key_in_block = index_iter->key();
+
+      // Restore original position
+      index_iter->Seek(current_position_key);
+      // Verify we restored correctly
+      assert(index_iter->Valid());
+      assert(index_iter->key().compare(current_position_key) == 0);
+    } else {
+      // No previous entry (we're at the first block)
+      // Restore position and use midpoint fallback
+      index_iter->Seek(current_position_key);
+      assert(index_iter->Valid());
+      return handle.size() / 2;
+    }
+  }
+
+  // Use lexicographical interpolation to estimate the position
+  const Comparator* ucmp = rep_->internal_comparator.user_comparator();
+  Slice user_key = ExtractUserKey(key);
+  Slice first_user_key = ExtractUserKey(first_key_in_block);
+  Slice last_user_key = ExtractUserKey(last_key_in_block);
+
+  // If key is <= first_key_in_block, it's at the beginning of the block
+  if (ucmp->Compare(user_key, first_user_key) <= 0) {
+    return handle.size();  // Return full size so when subtracted, we get the start of the block
+  }
+
+  // If key is >= last_key_in_block, it's at the end of the block
+  if (ucmp->Compare(user_key, last_user_key) >= 0) {
+    return 0;  // Return 0 so when subtracted, we still get the block's offset
+  }
+
+  // Find the common prefix length between first and last keys
+  size_t first_last_diff = first_user_key.difference_offset(last_user_key);
+
+  // If first and last key are the same (or one is prefix of the other), assume middle position
+  if (first_last_diff >= first_user_key.size() ||
+      first_last_diff >= last_user_key.size()) {
+    return handle.size() / 2;
+  }
+
+  // Find difference offsets between target key and endpoints
+  size_t first_target_diff = first_user_key.difference_offset(user_key);
+  size_t target_last_diff = user_key.difference_offset(last_user_key);
+
+  // If the difference offsets don't align with our expectations, default to middle
+  if (first_target_diff < first_last_diff && target_last_diff < first_last_diff) {
+    // Estimate the position by using the first differing byte
+    uint8_t first_byte = static_cast<uint8_t>(first_user_key[first_last_diff]);
+    uint8_t target_byte = static_cast<uint8_t>(user_key[first_last_diff]);
+    uint8_t last_byte = static_cast<uint8_t>(last_user_key[first_last_diff]);
+
+    // Ensure we have a valid range to interpolate over
+    if (last_byte > first_byte) {
+      // Calculate the ratio based on the byte values
+      double ratio = static_cast<double>(target_byte - first_byte) /
+                    static_cast<double>(last_byte - first_byte);
+
+      // Bound the ratio between 0 and 1
+      ratio = std::max(0.0, std::min(1.0, ratio));
+
+      // Estimate the offset within the block - inverted so the beginning of the block is handle.size()
+      // and the end of the block is 0
+      return static_cast<uint64_t>((1.0 - ratio) * handle.size());
+    }
+  }
+
+  // Fallback to middle position if interpolation can't be applied
+  return handle.size() / 2;
+}
+
 uint64_t BlockBasedTable::GetApproximateDataSize() {
   // Should be in table properties unless super old version
   if (rep_->table_properties) {
@@ -2605,7 +2703,6 @@ uint64_t BlockBasedTable::ApproximateOffsetOf(const Slice& key,
   if (index_iter != &iiter_on_stack) {
     iiter_unique_ptr.reset(index_iter);
   }
-
   index_iter->Seek(key);
   uint64_t offset;
   if (index_iter->status().ok()) {
@@ -2655,6 +2752,8 @@ uint64_t BlockBasedTable::ApproximateSize(const Slice& start, const Slice& end,
   uint64_t start_offset;
   if (index_iter->status().ok()) {
     start_offset = ApproximateDataOffsetOf(*index_iter, data_size);
+    uint64_t start_blk_offset = ApproximateDataOffsetWithinBlock(index_iter, start);
+    start_offset -= start_blk_offset;
   } else {
     // Assume file is involved from the start. This likely skews the estimate
     // but is consistent with the above error handling.
@@ -2665,6 +2764,8 @@ uint64_t BlockBasedTable::ApproximateSize(const Slice& start, const Slice& end,
   uint64_t end_offset;
   if (index_iter->status().ok()) {
     end_offset = ApproximateDataOffsetOf(*index_iter, data_size);
+    uint64_t end_blk_offset = ApproximateDataOffsetWithinBlock(index_iter, end);
+    end_offset -= end_blk_offset;
   } else {
     // Assume file is involved until the end. This likely skews the estimate
     // but is consistent with the above error handling.
@@ -2672,20 +2773,10 @@ uint64_t BlockBasedTable::ApproximateSize(const Slice& start, const Slice& end,
   }
 
   assert(end_offset >= start_offset);
-  uint64_t offset_diff = end_offset - start_offset;
-
-  if (offset_diff == 0) {
-    // If the offset difference is 0, it means the start and end keys lie within the same block.
-    // In this case, we overestimate and return the block size
-    if (index_iter->Valid()) {
-      BlockHandle handle = index_iter->value().handle;
-      offset_diff = handle.size();
-    }
-  }
 
   // Pro-rate file metadata (incl filters) size-proportionally across data
   // blocks.
-  double size_ratio = static_cast<double>(offset_diff) /
+  double size_ratio = static_cast<double>(end_offset - start_offset) /
                       static_cast<double>(data_size);
   return static_cast<uint64_t>(size_ratio *
                                static_cast<double>(rep_->file_size));

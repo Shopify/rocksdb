@@ -2672,9 +2672,20 @@ uint64_t BlockBasedTable::ApproximateSize(const Slice& start, const Slice& end,
   }
 
   assert(end_offset >= start_offset);
+  uint64_t offset_diff = end_offset - start_offset;
+
+  if (offset_diff == 0) {
+    // If the offset difference is 0, it means the start and end keys lie within the same block.
+    // In this case, we overestimate and return the block size
+    if (index_iter->Valid()) {
+      BlockHandle handle = index_iter->value().handle;
+      offset_diff = handle.size();
+    }
+  }
+
   // Pro-rate file metadata (incl filters) size-proportionally across data
   // blocks.
-  double size_ratio = static_cast<double>(end_offset - start_offset) /
+  double size_ratio = static_cast<double>(offset_diff) /
                       static_cast<double>(data_size);
   return static_cast<uint64_t>(size_ratio *
                                static_cast<double>(rep_->file_size));

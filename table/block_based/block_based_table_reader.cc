@@ -2623,53 +2623,87 @@ uint64_t BlockBasedTable::ApproximateDataOffsetWithinBlock(
   Slice first_user_key = ExtractUserKey(first_key_in_block);
   Slice last_user_key = ExtractUserKey(last_key_in_block);
 
-  // If key is <= first_key_in_block, it's at the beginning of the block
-  if (ucmp->Compare(user_key, first_user_key) <= 0) {
-    return handle.size();  // Return full size so when subtracted, we get the start of the block
+  double ratio = CalculateKeyPositionRatio(user_key, first_user_key, last_user_key, ucmp);
+  return static_cast<uint64_t>((1.0 - ratio) * handle.size());
+}
+
+// Calculate the position ratio of target_key between first_key and last_key
+// Returns a value between 0.0 (closer to first_key) and 1.0 (closer to last_key)
+double CalculateKeyPositionRatio(const Slice& target_key,
+                                const Slice& first_key,
+                                const Slice& last_key,
+                                const Comparator* comparator) {
+  // Boundary checks
+  if (comparator->Compare(target_key, first_key) <= 0) {
+    return 0.0;
+  }
+  if (comparator->Compare(target_key, last_key) >= 0) {
+    return 1.0;
   }
 
-  // If key is >= last_key_in_block, it's at the end of the block
-  if (ucmp->Compare(user_key, last_user_key) >= 0) {
-    return 0;  // Return 0 so when subtracted, we still get the block's offset
+  // Find the first position where first_key and last_key differ
+  size_t diff_pos = 0;
+  size_t min_len = std::min(first_key.size(), last_key.size());
+  while (diff_pos < min_len && first_key[diff_pos] == last_key[diff_pos]) {
+    diff_pos++;
   }
 
-  // Find the common prefix length between first and last keys
-  size_t first_last_diff = first_user_key.difference_offset(last_user_key);
-
-  // If first and last key are the same (or one is prefix of the other), assume middle position
-  if (first_last_diff >= first_user_key.size() ||
-      first_last_diff >= last_user_key.size()) {
-    return handle.size() / 2;
-  }
-
-  // Find difference offsets between target key and endpoints
-  size_t first_target_diff = first_user_key.difference_offset(user_key);
-  size_t target_last_diff = user_key.difference_offset(last_user_key);
-
-  // If the difference offsets don't align with our expectations, default to middle
-  if (first_target_diff < first_last_diff && target_last_diff < first_last_diff) {
-    // Estimate the position by using the first differing byte
-    uint8_t first_byte = static_cast<uint8_t>(first_user_key[first_last_diff]);
-    uint8_t target_byte = static_cast<uint8_t>(user_key[first_last_diff]);
-    uint8_t last_byte = static_cast<uint8_t>(last_user_key[first_last_diff]);
-
-    // Ensure we have a valid range to interpolate over
-    if (last_byte > first_byte) {
-      // Calculate the ratio based on the byte values
-      double ratio = static_cast<double>(target_byte - first_byte) /
-                    static_cast<double>(last_byte - first_byte);
-
-      // Bound the ratio between 0 and 1
-      ratio = std::max(0.0, std::min(1.0, ratio));
-
-      // Estimate the offset within the block - inverted so the beginning of the block is handle.size()
-      // and the end of the block is 0
-      return static_cast<uint64_t>((1.0 - ratio) * handle.size());
+  // If keys are identical up to the length of the shorter one,
+  // use length-based interpolation
+  if (diff_pos == min_len) {
+    if (first_key.size() == last_key.size()) {
+      // Keys are identical, shouldn't happen given boundary checks
+      return 0.5;
     }
+
+    // One key is a prefix of the other
+    double length_ratio = static_cast<double>(target_key.size() - first_key.size()) /
+                         static_cast<double>(last_key.size() - first_key.size());
+    return std::max(0.0, std::min(1.0, length_ratio));
   }
 
-  // Fallback to middle position if interpolation can't be applied
-  return handle.size() / 2;
+  // Use multi-byte interpolation for better accuracy
+  // Convert up to 8 bytes starting from diff_pos to a numeric value
+  auto extractNumericValue = [](const Slice& key, size_t start_pos) -> uint64_t {
+    uint64_t value = 0;
+    size_t bytes_to_read = std::min(size_t(8), key.size() - start_pos);
+
+    for (size_t i = 0; i < bytes_to_read; i++) {
+      value = (value << 8) | static_cast<uint8_t>(key[start_pos + i]);
+    }
+
+    // Pad with zeros if we read fewer than 8 bytes
+    value <<= (8 - bytes_to_read) * 8;
+    return value;
+  };
+
+  // Extract numeric values from the differing position
+  uint64_t first_value = extractNumericValue(first_key, diff_pos);
+  uint64_t last_value = extractNumericValue(last_key, diff_pos);
+  uint64_t target_value = extractNumericValue(target_key, diff_pos);
+
+  // Handle edge case where first and last values are the same
+  if (first_value == last_value) {
+    // This shouldn't happen given our diff_pos calculation, but just in case
+    return 0.5;
+  }
+
+  // Calculate interpolation ratio using full 64-bit precision
+  double ratio;
+  if (first_value < last_value) {
+    ratio = static_cast<double>(target_value - first_value) /
+            static_cast<double>(last_value - first_value);
+  } else {
+    // Handle reverse order
+    ratio = static_cast<double>(first_value - target_value) /
+            static_cast<double>(first_value - last_value);
+  }
+
+  // Apply smoothing for very small or very large ratios to avoid edge effects
+  if (ratio < 0.001) ratio = ratio * 0.5;
+  else if (ratio > 0.999) ratio = 0.999 + (ratio - 0.999) * 0.5;
+
+  return std::max(0.0, std::min(1.0, ratio));
 }
 
 uint64_t BlockBasedTable::GetApproximateDataSize() {

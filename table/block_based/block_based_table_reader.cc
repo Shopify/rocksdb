@@ -2574,59 +2574,6 @@ uint64_t BlockBasedTable::ApproximateDataOffsetOf(
   }
 }
 
-uint64_t BlockBasedTable::ApproximateDataOffsetWithinBlock(
-    InternalIteratorBase<IndexValue>* index_iter,
-    const Slice& key) const {
-  if (!index_iter->Valid()) {
-    return 0;
-  }
-
-  // Get the block handle for the data block
-  BlockHandle handle = index_iter->value().handle;
-
-  // If we have a first_internal_key in the index value, we can use it for better interpolation
-  Slice first_key_in_block;
-  Slice last_key_in_block = index_iter->key();
-
-  if (rep_->index_has_first_key) {
-    first_key_in_block = index_iter->value().first_internal_key;
-  } else {
-    // If first key is not available in the index, we can try to infer it
-    // by checking the previous entry in the index
-
-    // Save our current position and key
-    Slice current_position_key = last_key_in_block;
-
-    // Try to move to previous entry
-    index_iter->Prev();
-    if (index_iter->Valid()) {
-      // Got a previous entry, use its key as our first key approximation
-      first_key_in_block = index_iter->key();
-
-      // Restore original position
-      index_iter->Seek(current_position_key);
-      // Verify we restored correctly
-      assert(index_iter->Valid());
-      assert(index_iter->key().compare(current_position_key) == 0);
-    } else {
-      // No previous entry (we're at the first block)
-      // Restore position and use midpoint fallback
-      index_iter->Seek(current_position_key);
-      assert(index_iter->Valid());
-      return handle.size() / 2;
-    }
-  }
-
-  // Use lexicographical interpolation to estimate the position
-  const Comparator* ucmp = rep_->internal_comparator.user_comparator();
-  Slice user_key = ExtractUserKey(key);
-  Slice first_user_key = ExtractUserKey(first_key_in_block);
-  Slice last_user_key = ExtractUserKey(last_key_in_block);
-
-  double ratio = CalculateKeyPositionRatio(user_key, first_user_key, last_user_key, ucmp);
-  return static_cast<uint64_t>((1.0 - ratio) * handle.size());
-}
-
 // Calculate the position ratio of target_key between first_key and last_key
 // Returns a value between 0.0 (closer to first_key) and 1.0 (closer to last_key)
 double CalculateKeyPositionRatio(const Slice& target_key,
@@ -2704,6 +2651,59 @@ double CalculateKeyPositionRatio(const Slice& target_key,
   else if (ratio > 0.999) ratio = 0.999 + (ratio - 0.999) * 0.5;
 
   return std::max(0.0, std::min(1.0, ratio));
+}
+
+uint64_t BlockBasedTable::ApproximateDataOffsetWithinBlock(
+    InternalIteratorBase<IndexValue>* index_iter,
+    const Slice& key) const {
+  if (!index_iter->Valid()) {
+    return 0;
+  }
+
+  // Get the block handle for the data block
+  BlockHandle handle = index_iter->value().handle;
+
+  // If we have a first_internal_key in the index value, we can use it for better interpolation
+  Slice first_key_in_block;
+  Slice last_key_in_block = index_iter->key();
+
+  if (rep_->index_has_first_key) {
+    first_key_in_block = index_iter->value().first_internal_key;
+  } else {
+    // If first key is not available in the index, we can try to infer it
+    // by checking the previous entry in the index
+
+    // Save our current position and key
+    Slice current_position_key = last_key_in_block;
+
+    // Try to move to previous entry
+    index_iter->Prev();
+    if (index_iter->Valid()) {
+      // Got a previous entry, use its key as our first key approximation
+      first_key_in_block = index_iter->key();
+
+      // Restore original position
+      index_iter->Seek(current_position_key);
+      // Verify we restored correctly
+      assert(index_iter->Valid());
+      assert(index_iter->key().compare(current_position_key) == 0);
+    } else {
+      // No previous entry (we're at the first block)
+      // Restore position and use midpoint fallback
+      index_iter->Seek(current_position_key);
+      assert(index_iter->Valid());
+      return handle.size() / 2;
+    }
+  }
+
+  // Use lexicographical interpolation to estimate the position
+  const Comparator* ucmp = rep_->internal_comparator.user_comparator();
+  Slice user_key = ExtractUserKey(key);
+  Slice first_user_key = ExtractUserKey(first_key_in_block);
+  Slice last_user_key = ExtractUserKey(last_key_in_block);
+
+  double ratio = CalculateKeyPositionRatio(user_key, first_user_key, last_user_key, ucmp);
+  return static_cast<uint64_t>((1.0 - ratio) * handle.size());
 }
 
 uint64_t BlockBasedTable::GetApproximateDataSize() {

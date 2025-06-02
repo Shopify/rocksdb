@@ -2698,9 +2698,19 @@ uint64_t BlockBasedTable::ApproximateDataOffsetWithinBlock(
 
   // Use lexicographical interpolation to estimate the position
   const Comparator* ucmp = rep_->internal_comparator.user_comparator();
+  Slice user_key;
+  Slice first_user_key;
+  Slice last_user_key;
+
+  if (rep_->index_key_includes_seq) {
+    first_user_key = ExtractUserKey(first_key_in_block);
+    last_user_key = ExtractUserKey(last_key_in_block);
+  } else {
+    first_user_key = first_key_in_block;
+    last_user_key = last_key_in_block;
+  }
+
   Slice user_key = ExtractUserKey(key);
-  Slice first_user_key = ExtractUserKey(first_key_in_block);
-  Slice last_user_key = ExtractUserKey(last_key_in_block);
 
   double ratio = CalculateKeyPositionRatio(user_key, first_user_key, last_user_key, ucmp);
   return static_cast<uint64_t>((1.0 - ratio) * handle.size());

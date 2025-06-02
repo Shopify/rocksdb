@@ -2698,7 +2698,6 @@ uint64_t BlockBasedTable::ApproximateDataOffsetWithinBlock(
 
   // Use lexicographical interpolation to estimate the position
   const Comparator* ucmp = rep_->internal_comparator.user_comparator();
-  Slice user_key;
   Slice first_user_key;
   Slice last_user_key;
 

@@ -2669,6 +2669,38 @@ uint64_t BlockBasedTable::ApproximateSize(const Slice& start, const Slice& end,
     // Assume file is involved until the end. This likely skews the estimate
     // but is consistent with the above error handling.
     end_offset = data_size;
+    if (end_offset == start_offset) {
+      // If the end offset is the same as the start offset, then approximate by reading the block and calculating the offsets
+      ReadOptions read_options;
+      read_options.read_tier = kReadAllTier;
+      read_options.fill_cache = false;
+
+      DataBlockIter biter;
+      Status tmp_status;
+      NewDataBlockIterator<DataBlockIter>(
+          read_options, index_iter->value().handle, &biter, BlockType::kData, /*get_context=*/nullptr,
+          /*lookup_context=*/nullptr, /*prefetch_buffer=*/nullptr,
+          /*for_compaction=*/false, /*async_read=*/false, tmp_status);
+      if (biter.status().ok()) {
+        uint64_t start_offset_actual = 0;
+        uint64_t end_offset_actual = 0;
+
+        biter.SeekForGet(start);
+        if (biter.status().ok()) {
+          start_offset_actual = biter.ValueOffset();
+        }
+        biter.SeekForGet(end);
+        if (biter.status().ok()) {
+          end_offset_actual = biter.ValueOffset();
+        }
+
+        // Only use the actual offsets if both are valid
+        if (end_offset_actual != 0 && start_offset_actual != 0) {
+          end_offset = end_offset_actual;
+          start_offset = start_offset_actual;
+        }
+      }
+    }
   }
 
   assert(end_offset >= start_offset);
